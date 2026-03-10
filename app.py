@@ -44,9 +44,9 @@ def lire_csv_streamlit(uploaded_file):
                     df_raw = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, on_bad_lines='skip', header=None)
                     if len(df_raw.columns) > 1:
                         header_row = 0
-                        for i in range(min(20, len(df_raw))):
+                        for i in range(min(15, len(df_raw))):
                             ligne = " ".join(df_raw.iloc[i].fillna("").astype(str).str.upper())
-                            if ("CODE" in ligne or "ART" in ligne or "REF" in ligne) and ("QTE" in ligne or "QUANT" in ligne or "STOCK" in ligne or "PHYS" in ligne or "DATE" in ligne or "PLANIF" in ligne):
+                            if ("CODE" in ligne or "ART" in ligne or "REF" in ligne) and ("QTE" in ligne or "STOCK" in ligne or "PHYS" in ligne):
                                 header_row = i
                                 break
                         df = df_raw.iloc[header_row+1:].copy()
@@ -74,12 +74,11 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
         st.error("Fichiers manquants.")
     else:
         with st.spinner("Calculs en cours..."):
-            # 1. Chargement
+            # 1. Chargement & Calculs (Logique V19)
             df_mapping = pd.read_excel(f_bdd, dtype=str)
             df_commandes = lire_csv_streamlit(f_cmd)
             df_stocks = lire_csv_streamlit(f_stock)
             
-            # 2. Logiciel de calcul (Synthèse V19)
             dict_nomenclature = {}
             map_parent = {}
             composants_suivis = ['COL', 'COIFFE', 'ET', 'EL LABEL', 'CARTON', 'CE', 'STICKER']
@@ -125,7 +124,6 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
                                 list_prod.append(tmp.dropna(subset=['DATE_PROD']))
             df_prod_totale = pd.concat(list_prod).sort_values('DATE_PROD') if list_prod else pd.DataFrame()
 
-            # 3. Calcul Dispo
             c_art_cde = next((c for c in df_commandes.columns if 'CODE' in c or 'ARTICLE' in c), df_commandes.columns[0])
             df_commandes['CLE_CDE'] = df_commandes[c_art_cde].apply(nettoyer_code)
             for comp in composants_suivis:
@@ -151,7 +149,7 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
 
             df_commandes['DATE_DISPO_ESTIMEE'] = df_commandes.apply(verifier_dispo, axis=1)
 
-            # 4. Génération Excel (AVANT la synchro pour éviter les erreurs NameError)
+            # 2. Génération Excel (Sécurisée)
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 cols_export = [c for c in df_commandes.columns if c not in ['CLE_CDE', 'CUMUL', 'QTE_CDE']]
@@ -180,20 +178,23 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
             st.success("✅ Dashboard Excel prêt !")
             st.download_button("📥 Télécharger l'Excel Usine", data=output.getvalue(), file_name="DASHBOARD_BELAIRE.xlsx")
 
-            # 5. Synchro Cloud (Tentative)
+            # 3. Synchro Cloud
             try:
-                scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-                # Lecture simplifiée du secret
-                creds_info = json.loads(st.secrets["json_key"])
-                creds = Credentials.from_service_account_info(creds_info, scopes=scope)
-                client = gspread.authorize(creds)
-                
-                sheet = client.open("Belaire_DB_Commandes").sheet1
-                df_sync = df_commandes[['NUM_CDE', 'EXPE_NOM_CLIENT', 'DATE_DISPO_ESTIMEE']].copy()
-                df_sync['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                
-                sheet.clear()
-                sheet.update([df_sync.columns.values.tolist()] + df_sync.values.tolist())
-                st.success("🌐 Portail Client mis à jour !")
+                if "json_key" not in st.secrets:
+                    st.error("❌ Secret 'json_key' manquant dans les paramètres Streamlit.")
+                else:
+                    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+                    # On transforme le texte brut en dictionnaire JSON
+                    creds_info = json.loads(st.secrets["json_key"])
+                    creds = Credentials.from_service_account_info(creds_info, scopes=scope)
+                    client = gspread.authorize(creds)
+                    
+                    sheet = client.open("Belaire_DB_Commandes").sheet1
+                    df_sync = df_commandes[['NUM_CDE', 'EXPE_NOM_CLIENT', 'DATE_DISPO_ESTIMEE']].copy()
+                    df_sync['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    
+                    sheet.clear()
+                    sheet.update([df_sync.columns.values.tolist()] + df_sync.values.tolist())
+                    st.success("🌐 Portail Client mis à jour !")
             except Exception as e:
-                st.error(f"⚠️ Synchro Cloud échouée (mais Excel OK) : {e}")
+                st.error(f"⚠️ Erreur Cloud : {e}")
