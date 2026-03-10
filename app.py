@@ -58,31 +58,22 @@ def lire_csv_streamlit(uploaded_file):
 
 # --- INTELLIGENCE : CALCUL DE LA DATE CRITIQUE (MAX) ---
 def calculer_date_max_robuste(serie_dates):
-    # On convertit tout en liste de textes propres
     liste = [str(d).strip() for d in serie_dates.tolist() if pd.notna(d)]
-    
-    # 1. Priorité absolue : Si un élément n'a pas de prod prévue, toute la commande est bloquée
     if any("Pas de prod prévue" in s for s in liste):
         return "Pas de prod prévue"
     
-    # 2. On extrait toutes les dates valides pour trouver la plus lointaine
     dates_trouvees = []
     for s in liste:
-        # Regex flexible pour JJ/MM/AAAA ou J/M/AAAA
         match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', s)
         if match:
             try:
-                # On essaie de convertir en vrai objet Date pour comparer
                 d_obj = datetime.strptime(match.group(1), "%d/%m/%Y")
                 dates_trouvees.append(d_obj)
             except:
                 continue
     
-    # 3. Si on a des dates, on prend la plus grande (la plus loin dans le futur)
     if dates_trouvees:
         return max(dates_trouvees).strftime("%d/%m/%Y")
-    
-    # 4. Par défaut, si rien d'autre, c'est que tout est en stock
     return "En Stock"
 
 # --- SYNCHRO CLOUD ---
@@ -98,21 +89,18 @@ def mettre_a_jour_google_sheets(df_global):
         client = gspread.authorize(creds)
         sheet = client.open("Belaire_DB_Commandes").sheet1
 
-        # NETTOYAGE DES COLONNES DE REGROUPEMENT
-        # On cherche la colonne Commande et Client
-        col_cde = next((c for c in df_global.columns if 'NUM' in c and 'CDE' in c) or [None], df_global.columns[0])
-        col_cli = next((c for c in df_global.columns if 'CLI' in c) or [None], df_global.columns[1])
+        # On nettoie les noms de colonnes pour le groupement
+        col_cde = next((c for c in df_global.columns if 'NUM' in c and 'CDE' in c), df_global.columns[0])
+        col_cli = next((c for c in df_global.columns if 'CLI' in c), df_global.columns[1])
         
-        # On crée un petit DataFrame de synthèse
         df_temp = df_global.copy()
-        df_temp[col_cde] = df_temp[col_cde].astype(str).str.strip() # Enlever les espaces
+        df_temp[col_cde] = df_temp[col_cde].astype(str).str.strip()
         
         df_client = df_temp.groupby(col_cde).agg({
             col_cli: 'first',
             'DATE_DISPO_ESTIMEE': lambda x: calculer_date_max_robuste(x)
         }).reset_index()
         
-        # On renomme pour le Google Sheets
         df_client.columns = ['NUM_CDE', 'CLIENT', 'DATE_DISPO', 'DERNIERE_MAJ']
         df_client['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
 
@@ -131,26 +119,25 @@ with col1:
     f_stock = st.file_uploader("2. Stock (csv)", type=['csv'])
     f_cmd = st.file_uploader("3. Commandes (csv)", type=['csv'])
 with col2:
-    st.subheader("🏭 Production")
-    f_std = st.file_uploader("OF STD", type=['csv'])
-    f_mgc = st.file_uploader("OF MGC", type=['csv'])
-    f_roya = f_std # Simplification si besoin
+    st.subheader("🏭 Production (OF)")
+    f_std = st.file_uploader("OF Production STD", type=['csv'])
+    f_mgc = st.file_uploader("OF Production MGC", type=['csv'])
+    f_roya = st.file_uploader("OF Production ROYA", type=['csv'])
 
 if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
     if not f_bdd or not f_stock or not f_cmd:
-        st.error("Fichiers manquants.")
+        st.error("Fichiers obligatoires manquants.")
     else:
-        with st.spinner("Analyse de la date critique par commande..."):
+        with st.spinner("Analyse des 3 sites de production et calcul des dates critiques..."):
             # 1. Chargement
             df_mapping = pd.read_excel(f_bdd, dtype=str)
             df_commandes = lire_csv_streamlit(f_cmd)
             df_stocks = lire_csv_streamlit(f_stock)
             
-            # 2. Calculs (Logique V19 stable)
+            # 2. Configuration nomenclature
             dict_nomenclature = {}
             map_parent = {}
             composants_suivis = ['COL', 'COIFFE', 'ET', 'EL LABEL', 'CARTON', 'CE', 'STICKER']
-            
             df_mapping['CLE_MAP'] = df_mapping['CODE ARTICLE'].apply(nettoyer_code)
             for _, row in df_mapping.iterrows():
                 cle = row['CLE_MAP']
@@ -158,6 +145,7 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
                 map_parent[cle] = nettoyer_code(row.get('CODE SF/PROD', cle)) or cle
                 dict_nomenclature[cle] = {comp: extraire_codes_multiples(str(row.get(next((c for c in df_mapping.columns if comp in c), ""), "")))[0] if extraire_codes_multiples(str(row.get(next((c for c in df_mapping.columns if comp in c), ""), ""))) else "" for comp in composants_suivis}
 
+            # Stock
             dict_stock = {}
             if not df_stocks.empty:
                 c_art_s = next((c for c in df_stocks.columns if 'CODE' in c or 'ARTICLE' in c), df_stocks.columns[0])
@@ -166,8 +154,9 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
                 df_stocks['QTE_PROPRE'] = nettoyer_nombre(df_stocks[c_qte_s])
                 dict_stock = df_stocks.groupby('CLE_STK')['QTE_PROPRE'].sum().to_dict()
 
+            # Fusion des 3 sites de production
             list_prod = []
-            for site, f_p in {'STD': f_std, 'MGC': f_mgc}.items():
+            for site, f_p in {'STD': f_std, 'MGC': f_mgc, 'ROYA': f_roya}.items():
                 if f_p:
                     df_p = lire_csv_streamlit(f_p)
                     if not df_p.empty:
@@ -212,7 +201,7 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
             df_commandes.to_excel(output, index=False, engine='xlsxwriter')
             
             st.success("✅ Dashboard Excel prêt.")
-            st.download_button("📥 Télécharger l'Excel", data=output.getvalue(), file_name="DASHBOARD_BELAIRE.xlsx")
+            st.download_button("📥 Télécharger l'Excel Usine", data=output.getvalue(), file_name="DASHBOARD_BELAIRE.xlsx")
 
             if mettre_a_jour_google_sheets(df_commandes):
-                st.info("🌐 Portail Client mis à jour : les dates critiques (Max) ont été synchronisées.")
+                st.info("🌐 Portail Client mis à jour : les dates critiques (Max) ont été synchronisées pour les 3 sites.")
