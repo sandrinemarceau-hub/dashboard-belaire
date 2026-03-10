@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -55,28 +56,6 @@ def lire_csv_streamlit(uploaded_file):
         except: continue
     return pd.DataFrame()
 
-# --- SYNCHRO GOOGLE SHEETS ---
-def mettre_a_jour_google_sheets(df):
-    try:
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        # On récupère le dictionnaire complet depuis les secrets
-        creds_info = st.secrets["gcp_service_account"]
-        creds = Credentials.from_service_account_info(creds_info, scopes=scope)
-        client = gspread.authorize(creds)
-        
-        sheet = client.open("Belaire_DB_Commandes").sheet1
-        
-        # On prépare un résumé propre
-        df_sync = df[['NUM_CDE', 'EXPE_NOM_CLIENT', 'DATE_DISPO_ESTIMEE']].copy()
-        df_sync['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
-        
-        sheet.clear()
-        sheet.update([df_sync.columns.values.tolist()] + df_sync.values.tolist())
-        return True
-    except Exception as e:
-        st.error(f"Erreur de synchro Cloud : {e}")
-        return False
-
 # --- INTERFACE ---
 col1, col2 = st.columns(2)
 with col1:
@@ -100,7 +79,7 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
             df_commandes = lire_csv_streamlit(f_cmd)
             df_stocks = lire_csv_streamlit(f_stock)
             
-            # 2. Logiciel de calcul
+            # 2. Logiciel de calcul (Synthèse V19)
             dict_nomenclature = {}
             map_parent = {}
             composants_suivis = ['COL', 'COIFFE', 'ET', 'EL LABEL', 'CARTON', 'CE', 'STICKER']
@@ -172,7 +151,7 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
 
             df_commandes['DATE_DISPO_ESTIMEE'] = df_commandes.apply(verifier_dispo, axis=1)
 
-            # 4. Génération Excel
+            # 4. Génération Excel (AVANT la synchro pour éviter les erreurs NameError)
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 cols_export = [c for c in df_commandes.columns if c not in ['CLE_CDE', 'CUMUL', 'QTE_CDE']]
@@ -198,8 +177,23 @@ if st.button("🚀 GÉNÉRER & SYNCHRONISER"):
                                 ws.write(r + 1, c_idx, val, f_ok if stk_val > 0 else f_nok)
                 ws.set_column('A:AZ', 18)
 
-            # 5. Synchro & Bouton
-            success = mettre_a_jour_google_sheets(df_commandes)
-            if success: st.success("🌐 Portail Client mis à jour !")
-            
+            st.success("✅ Dashboard Excel prêt !")
             st.download_button("📥 Télécharger l'Excel Usine", data=output.getvalue(), file_name="DASHBOARD_BELAIRE.xlsx")
+
+            # 5. Synchro Cloud (Tentative)
+            try:
+                scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+                # Lecture simplifiée du secret
+                creds_info = json.loads(st.secrets["json_key"])
+                creds = Credentials.from_service_account_info(creds_info, scopes=scope)
+                client = gspread.authorize(creds)
+                
+                sheet = client.open("Belaire_DB_Commandes").sheet1
+                df_sync = df_commandes[['NUM_CDE', 'EXPE_NOM_CLIENT', 'DATE_DISPO_ESTIMEE']].copy()
+                df_sync['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                
+                sheet.clear()
+                sheet.update([df_sync.columns.values.tolist()] + df_sync.values.tolist())
+                st.success("🌐 Portail Client mis à jour !")
+            except Exception as e:
+                st.error(f"⚠️ Synchro Cloud échouée (mais Excel OK) : {e}")
