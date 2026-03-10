@@ -47,19 +47,28 @@ def lire_csv_streamlit(uploaded_file):
                         header_row = 0
                         for i in range(min(15, len(df_raw))):
                             ligne = " ".join(df_raw.iloc[i].fillna("").astype(str).str.upper())
-                            if ("CODE" in ligne or "ART" in ligne or "REF" in ligne) and ("QTE" in ligne or "STOCK" in ligne):
+                            if ("CODE" in ligne or "ART" in ligne or "REF" in ligne) and ("QTE" in ligne or "QUANTITE" in ligne or "STOCK" in ligne):
                                 header_row = i
                                 break
                         df = df_raw.iloc[header_row+1:].copy()
-                        df.columns = [str(c).strip().upper() for c in df_raw.iloc[header_row].values]
+                        cols = []
+                        for c in df_raw.iloc[header_row].values:
+                            name = re.sub(r'[^\w\s]', '', str(c)).strip().upper()
+                            cols.append(name if name else f"COL_{len(cols)}")
+                        df.columns = cols
                         return df
                 except: continue
         except: continue
     return pd.DataFrame()
 
+# --- INTELLIGENCE : DATE MAX + MARGE 2 JOURS OUVRÉS ---
 def calculer_date_max_robuste(serie_dates):
     liste = [str(d).strip() for d in serie_dates.tolist() if pd.notna(d)]
-    if any("Pas de prod prévue" in s for s in liste): return "No production planned"
+    
+    # Si la moindre ligne n'a pas de prod prévue, toute la commande bloque
+    if any("Pas de prod prévue" in s for s in liste) or any("No production planned" in s for s in liste): 
+        return "No production planned"
+    
     dates_trouvees = []
     for s in liste:
         match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', s)
@@ -68,30 +77,38 @@ def calculer_date_max_robuste(serie_dates):
                 d_obj = datetime.strptime(match.group(1), "%d/%m/%Y")
                 dates_trouvees.append(d_obj)
             except: continue
-    if dates_trouvees: return max(dates_trouvees).strftime("%d/%m/%Y")
+            
+    if dates_trouvees:
+        # On prend la date la plus lointaine
+        date_max = max(dates_trouvees)
+        # 🛡️ AJOUT DE LA MARGE : +2 Jours Ouvrés (sans compter les week-ends)
+        date_securisee = date_max + pd.offsets.BusinessDay(2)
+        return date_securisee.strftime("%d/%m/%Y")
+        
     return "In Stock"
 
-# --- SYNCHRO CLOUD AVEC RÉFÉRENCE CLIENT ---
+# --- SYNCHRO CLOUD (AVEC RÉFÉRENCE CLIENT / PO) ---
 def mettre_a_jour_google_sheets(df_global):
     try:
-        if "json_key" not in st.secrets: return False
+        if "json_key" not in st.secrets: 
+            st.error("Secret 'json_key' manquant.")
+            return False
+            
         scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds_info = json.loads(st.secrets["json_key"])
         creds = Credentials.from_service_account_info(creds_info, scopes=scope)
         client = gspread.authorize(creds)
         sheet = client.open("Belaire_DB_Commandes").sheet1
         
-        # Identification des colonnes
+        # Identification automatique des colonnes
         col_cde = next((c for c in df_global.columns if 'NUM' in c and 'CDE' in c), df_global.columns[0])
         col_cli = next((c for c in df_global.columns if 'CLI' in c), df_global.columns[1])
-        
-        # On récupère la colonne C (index 2) pour la référence client
-        col_ref_client = df_global.columns[2] 
+        col_ref_client = df_global.columns[2] # Colonne C (PO du client)
         
         df_temp = df_global.copy()
         df_temp[col_cde] = df_temp[col_cde].astype(str).str.strip()
         
-        # Synthèse par commande (on garde la ref client de la colonne C)
+        # Synthèse par commande pour le client
         df_client = df_temp.groupby(col_cde).agg({
             col_ref_client: 'first',
             col_cli: 'first',
@@ -100,14 +117,14 @@ def mettre_a_jour_google_sheets(df_global):
         
         df_client['DERNIERE_MAJ'] = datetime.now().strftime("%d/%m/%Y %H:%M")
         
-        # Nouveaux noms de colonnes pour le Sheets
+        # On renomme pour le Google Sheets
         df_client.columns = ['INTERNAL_ID', 'CUSTOMER_REF', 'CLIENT_NAME', 'DISPO_DATE', 'LAST_UPDATE']
 
         sheet.clear()
         sheet.update([df_client.columns.values.tolist()] + df_client.values.tolist())
         return True
     except Exception as e:
-        st.error(f"Sync error : {e}")
+        st.error(f"Erreur de synchro : {e}")
         return False
 
 # --- INTERFACE ---
@@ -127,27 +144,36 @@ if st.button("🚀 GENERATE & SYNC"):
     if not f_bdd or not f_stock or not f_cmd:
         st.error("Missing files.")
     else:
-        with st.spinner("Processing..."):
+        with st.spinner("Processing & Calculating Safe Dates..."):
             df_mapping = pd.read_excel(f_bdd, dtype=str)
             df_commandes = lire_csv_streamlit(f_cmd)
             df_stocks = lire_csv_streamlit(f_stock)
             
-            # Logiciel de calcul (identique à précédemment)
-            # ... [Le reste du code de calcul reste le même] ...
-            # [Note: J'ai raccourci ici pour la lecture, mais garde bien TOUTE ta logique de calcul entre les deux]
-            
-            # --- CALCULS ---
+            # --- 1. NOMENCLATURE ---
             df_mapping['CLE_MAP'] = df_mapping['CODE ARTICLE'].apply(nettoyer_code)
-            map_parent = {row['CLE_MAP']: nettoyer_code(row.get('CODE SF/PROD', row['CLE_MAP'])) for _, row in df_mapping.iterrows() if row['CLE_MAP']}
-            
-            # Stocks
-            c_art_s = next((c for c in df_stocks.columns if 'CODE' in c or 'ARTICLE' in c), df_stocks.columns[0])
-            c_qte_s = next((c for c in df_stocks.columns if 'STOCK' in c or 'PHYS' in c or 'QTE' in c), df_stocks.columns[-1])
-            df_stocks['CLE_STK'] = df_stocks[c_art_s].apply(nettoyer_code)
-            df_stocks['QTE_PROPRE'] = nettoyer_nombre(df_stocks[c_qte_s])
-            dict_stock = df_stocks.groupby('CLE_STK')['QTE_PROPRE'].sum().to_dict()
+            map_parent = {}
+            dict_nomenclature = {}
+            composants_suivis = ['COL', 'COIFFE', 'ET', 'EL LABEL', 'CARTON', 'CE', 'STICKER']
+            for _, row in df_mapping.iterrows():
+                cle = row['CLE_MAP']
+                if not cle: continue
+                map_parent[cle] = nettoyer_code(row.get('CODE SF/PROD', cle)) or cle
+                dict_nomenclature[cle] = {comp: extraire_codes_multiples(str(row.get(next((c for c in df_mapping.columns if comp in c), ""), "")))[0] if extraire_codes_multiples(str(row.get(next((c for c in df_mapping.columns if comp in c), ""), ""))) else "" for comp in composants_suivis}
 
-            # Production fusionnée
+            # --- 2. STOCKS ---
+            dict_stock = {}
+            if not df_stocks.empty:
+                c_art_s = next((c for c in df_stocks.columns if 'CODE' in c or 'ARTICLE' in c), df_stocks.columns[0])
+                if isinstance(c_art_s, list): c_art_s = c_art_s[0]
+                
+                c_qte_s = next((c for c in df_stocks.columns if 'STOCK' in c or 'PHYS' in c or 'QTE' in c), df_stocks.columns[-1])
+                if isinstance(c_qte_s, list): c_qte_s = c_qte_s[0]
+                
+                df_stocks['CLE_STK'] = df_stocks[c_art_s].apply(nettoyer_code)
+                df_stocks['QTE_PROPRE'] = nettoyer_nombre(df_stocks[c_qte_s])
+                dict_stock = df_stocks.groupby('CLE_STK')['QTE_PROPRE'].sum().to_dict()
+
+            # --- 3. PROD (3 SITES) ---
             list_prod = []
             for site, f_p in {'STD': f_std, 'MGC': f_mgc, 'ROYA': f_roya}.items():
                 if f_p:
@@ -166,13 +192,16 @@ if st.button("🚀 GENERATE & SYNC"):
                                 list_prod.append(tmp.dropna(subset=['DATE_PROD']))
             df_prod_totale = pd.concat(list_prod).sort_values('DATE_PROD') if list_prod else pd.DataFrame()
 
-            # Dispo
+            # --- 4. DISPO ---
             c_art_cde = next((c for c in df_commandes.columns if 'CODE' in c or 'ARTICLE' in c), df_commandes.columns[0])
             df_commandes['CLE_CDE'] = df_commandes[c_art_cde].apply(nettoyer_code)
             c_qte_cde = next((c for c in df_commandes.columns if 'TOTAL' in c or 'QTE' in c), df_commandes.columns[-1])
             df_commandes['QTE_CDE'] = nettoyer_nombre(df_commandes[c_qte_cde])
             df_commandes = df_commandes.sort_values(by=['CLE_CDE'])
             df_commandes['CUMUL'] = df_commandes.groupby('CLE_CDE')['QTE_CDE'].cumsum()
+            
+            for comp in composants_suivis:
+                df_commandes[comp] = df_commandes['CLE_CDE'].apply(lambda x: dict_nomenclature.get(x, {}).get(comp, '')).astype(str)
 
             def verifier_dispo(row):
                 c = row['CLE_CDE'] 
@@ -189,12 +218,12 @@ if st.button("🚀 GENERATE & SYNC"):
 
             df_commandes['DATE_DISPO_ESTIMEE'] = df_commandes.apply(verifier_dispo, axis=1)
 
-            # Export Excel
+            # --- 5. EXPORT EXCEL ---
             output = io.BytesIO()
             df_commandes.to_excel(output, index=False, engine='xlsxwriter')
-            st.success("✅ Dashboard Ready")
+            st.success("✅ Factory Dashboard Ready.")
             st.download_button("📥 Download Excel", data=output.getvalue(), file_name="DASHBOARD_BELAIRE.xlsx")
             
-            # SYNCHRO
+            # --- 6. SYNCHRO CLOUD ---
             if mettre_a_jour_google_sheets(df_commandes):
-                st.info("🌐 Client Portal updated with Customer References!")
+                st.info("🌐 Client Portal synchronized successfully (with +2 Business Days margin) !")
